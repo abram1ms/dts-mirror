@@ -1,0 +1,108 @@
+name: Backup Debian Security Tracker
+
+on:
+  schedule:
+    # Каждый день в 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download and validate JSON with retries
+        run: |
+          MAX_RETRIES=5
+          RETRY_DELAY=90 # Пауза в секундах между попытками
+          SUCCESS=false
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "=== Попытка $i из $MAX_RETRIES ==="
+            
+            # Скачиваем с таймаутом на соединение и операцию
+            if curl -fSL --connect-timeout 30 --max-time 300 -o data.json https://security-tracker.debian.org/tracker/data/json; then
+              # Проверяем JSON на валидность
+              if jq empty data.json > /dev/null 2>&1; then
+                echo "✅ Файл успешно скачан и прошел проверку валидности."
+                SUCCESS=true
+                break
+              else
+                echo "⚠️ Файл скачан, но не является валидным JSON (сервер отдал ошибку или неполный файл)."
+              fi
+            else
+              echo "⚠️ Ошибка сети или сервер Debian вернул ошибку при скачивании."
+            fi
+
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "Ожидание $RETRY_DELAY сек перед следующей попыткой..."
+              sleep $RETRY_DELAY
+            fi
+          done
+
+          # Если за все попытки валидный файл так и не получен — аварийный выход
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Ошибка: не удалось получить валидный JSON за $MAX_RETRIES попыток."
+            exit 1
+          fi
+
+      - name: Compress and calculate hashes
+        id: prepare
+        run: |
+          DATE_UTC=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          TAG_NAME="backup-$(date -u +"%Y%m%d-%H%M%S")"
+          RELEASE_TITLE="Backup $(date -u +"%Y-%m-%d")"
+
+          ARCHIVE_NAME="debian-security-tracker.tar.gz"
+          tar -czf "$ARCHIVE_NAME" data.json
+
+          RAW_SHA256=$(sha256sum data.json | awk '{print $1}')
+          ARCHIVE_SHA256=$(sha256sum "$ARCHIVE_NAME" | awk '{print $1}')
+          RAW_SIZE=$(du -h data.json | awk '{print $1}')
+          ARCHIVE_SIZE=$(du -h "$ARCHIVE_NAME" | awk '{print $1}')
+
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "title=$RELEASE_TITLE" >> $GITHUB_OUTPUT
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+          
+          cat <<EOF > release_notes.md
+          ### Debian Security Tracker Backup
+          
+          - **Дата создания:** \`$DATE_UTC\`
+          - **Источник:** https://security-tracker.debian.org/tracker/data/json
+          
+          #### Файлы и контрольные суммы:
+          | Файл | Размер | SHA-256 |
+          |---|---|---|
+          | \`$ARCHIVE_NAME\` | $ARCHIVE_SIZE | \`$ARCHIVE_SHA256\` |
+          | \`data.json\` (внутри) | $RAW_SIZE | \`$RAW_SHA256\` |
+          EOF
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.prepare.outputs.tag_name }}" \
+            "${{ steps.prepare.outputs.archive_name }}" \
+            --title "${{ steps.prepare.outputs.title }}" \
+            --notes-file release_notes.md \
+            --latest
+
+      - name: Cleanup old releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_COUNT: 60
+        run: |
+          echo "Оставляем только последние $KEEP_COUNT релизов..."
+          gh release list --limit 1000 --json tagName --jq ".[$KEEP_COUNT:][].tagName" | while read -r old_tag; do
+            if [ -n "$old_tag" ]; then
+              echo "Удаление старого релиза и тега: $old_tag"
+              gh release delete "$old_tag" --cleanup-tag -y || true
+            fi
+          done
