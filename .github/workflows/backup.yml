@@ -3,7 +3,7 @@ name: Backup Debian Security Tracker
 on:
   schedule:
     # Каждый день в 03:00 UTC
-    - cron: '25 3 * * *'
+    - cron: '57 20 * * *'
   workflow_dispatch:
 
 permissions:
